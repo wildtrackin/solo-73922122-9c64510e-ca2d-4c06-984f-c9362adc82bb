@@ -85,8 +85,12 @@
       <button id="btn-rotate">发起密钥轮换</button>
       <span class="small">阻塞中上传 <b id="blk-up">0</b> · 阻塞中下载 <b id="blk-dl">0</b></span>
     </div>
+    <div id="fault-box" style="display:none;margin-top:10px;padding:10px 12px;border:1px solid var(--red);border-radius:8px;background:rgba(248,81,73,.08)">
+      <div style="color:var(--red);font-weight:600">⚠ 课题密钥故障 — 轮换已安全暂停（进度保留，旧钥未删除，未生成替代密钥）</div>
+      <div id="fault-detail" style="margin-top:4px;font-size:12.5px"></div>
+    </div>
     <h2 style="margin-top:16px">课题密钥目录 keys/（与 vault/ 密文分目录）</h2>
-    <table><thead><tr><th>ID</th><th>key_id</th><th>状态</th><th>密钥文件</th><th>创建时间</th></tr></thead>
+    <table><thead><tr><th>ID</th><th>key_id</th><th>状态</th><th>密钥文件</th><th>被引用</th><th>创建时间</th></tr></thead>
       <tbody id="keys-body"></tbody></table>
   </section>
 
@@ -228,8 +232,10 @@ async function refresh() {
     $('upload-hint').textContent = `单文件上限 ${cfg.max_file_size_mib} MiB`;
 
     $('active-kek').textContent = status.active_kek ? '#' + status.active_kek.id + '  ' + status.active_kek.key_id : '—';
+    const fault = status.fault || null;
     const st = status.active ? status.state : 'idle';
-    $('rot-state').textContent = st; $('rot-state').className = 'badge b-' + st;
+    $('rot-state').textContent = fault ? st + ' · 故障暂停' : st;
+    $('rot-state').className = 'badge ' + (fault ? 'b-failed' : 'b-' + st);
     $('btn-rotate').disabled = !!status.active;
     $('blk-up').textContent = status.active ? status.blocking_uploads : 0;
     $('blk-dl').textContent = status.active ? status.blocking_downloads : 0;
@@ -237,21 +243,45 @@ async function refresh() {
       const pct = status.total ? Math.round(status.rewrapped / status.total * 100) : 100;
       $('rot-bar').style.width = pct + '%';
       $('rot-numbers').textContent = `重封装 ${status.rewrapped}/${status.total} 件（${pct}%）· 新 KEK #${status.new_kek_id}`;
-      $('rot-msg').textContent = status.message || '';
+      $('rot-msg').textContent = fault ? '⚠ ' + fault.message : (status.message || '');
     } else {
       $('rot-bar').style.width = status.last ? '100%' : '0%';
       $('rot-numbers').textContent = status.last ? `上次轮换已于 ${status.last.completed_at} 完成：${status.last.message || ''}` : '尚无轮换记录';
       $('rot-msg').textContent = '';
     }
 
+    // 故障密钥与受影响影像（缺钥故障：保留进度与旧钥，放回原密钥备份并重启后续办）
+    const keyFaults = keys.filter(k => k.fault);
+    const affected = files.filter(f => !f.kek_file_exists || (fault && f.kek_id === fault.kek_id));
+    if (fault || keyFaults.length) {
+      $('fault-box').style.display = '';
+      let html = '';
+      if (fault) {
+        html += `<div><b>故障密钥：</b>#${fault.kek_id} <span class="mono">${esc(fault.key_id)}</span>`
+          + `（${fault.role === 'new' ? '轮换新钥' : '轮换旧钥'} · ${fault.kind === 'missing' ? '密钥文件缺失' : '无法解封既有数据密钥'}）</div>`
+          + `<div style="margin-top:2px">${esc(fault.message)}</div>`;
+      } else {
+        html += `<div><b>故障密钥：</b>${keyFaults.map(k => '#' + k.id + ' <span class="mono">' + esc(k.key_id) + '</span>').join('、')}（密钥文件缺失且仍被引用）</div>`;
+      }
+      if (affected.length) {
+        html += `<div style="margin-top:2px"><b>受影响影像（${affected.length}）：</b><span class="mono">${affected.map(f => esc(f.filename)).join('、')}</span> — 这些影像暂不可下载，其余影像不受影响。</div>`;
+      }
+      html += `<div class="small" style="margin-top:4px">处置：将原课题密钥备份放回原路径（keys/&lt;key_id&gt;.kek）并重启服务，即可自动续办同一次轮换；反复重启不会生成替代密钥、不会删除旧钥、不会改写原件密文。</div>`;
+      $('fault-detail').innerHTML = html;
+    } else {
+      $('fault-box').style.display = 'none';
+    }
+
     $('keys-body').innerHTML = keys.map(k =>
       `<tr><td>${k.id}</td><td class="mono truncate" title="${esc(k.key_id)}">${esc(k.key_id)}</td>
-       <td>${badge(k.status)}</td><td>${k.file_exists ? '存在（600）' : '<span class="small">已删除</span>'}</td>
-       <td class="small">${esc(k.created_at)}</td></tr>`).join('') || '<tr><td colspan="5" class="small">暂无</td></tr>';
+       <td>${badge(k.status)}${k.fault ? ' <span class="badge b-failed">故障</span>' : ''}</td>
+       <td>${k.file_exists ? '存在（600）' : (k.status === 'deleted' ? '<span class="small">已删除</span>' : '<span style="color:var(--red);font-weight:600">缺失！</span>')}</td>
+       <td>${k.referenced_files ?? 0} 影像</td>
+       <td class="small">${esc(k.created_at)}</td></tr>`).join('') || '<tr><td colspan="6" class="small">暂无</td></tr>';
 
     $('files-body').innerHTML = files.map(f =>
       `<tr><td class="mono">${short(f.file_id)}</td><td class="truncate" title="${esc(f.filename)}">${esc(f.filename)}</td>
-       <td>${fmtSize(f.size)}</td><td class="mono">#${f.kek_id} ${short(f.kek_key_id,8)}</td>
+       <td>${fmtSize(f.size)}</td><td class="mono">#${f.kek_id} ${short(f.kek_key_id,8)}${f.kek_file_exists ? '' : ' <span class="badge b-failed">密钥缺失</span>'}</td>
        <td class="mono small">${short(f.sha256,18)}</td><td class="small">${esc(f.created_at)}</td>
        <td><button onclick="startDownload('${f.file_id}','${esc(f.filename)}')">下载</button></td></tr>`
     ).join('') || '<tr><td colspan="7" class="small">暂无归档影像</td></tr>';

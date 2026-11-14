@@ -7,7 +7,9 @@
 4. 上传待登记暂停：收尾后不留下旧钥引用；
 5. 下载待解封暂停：已受理下载必须读完原件；
 6. 轮换中重启自动续办，已归档文件始终可解密；
-7. 同期只允许一次轮换。
+7. 同期只允许一次轮换；
+8. 不完整备份恢复（轮换新钥文件缺失）：保留进度与旧钥、不生成替代密钥、
+   不报完成，受影响下载明确报错，放回原密钥备份并重启后续办同一次轮换。
 """
 
 from __future__ import annotations
@@ -353,3 +355,144 @@ class TestArchive:
             # 重新上传仍然成功。
             new_id = _upload(client, payload, "orphan.tif")
             assert _download(client, new_id) == payload
+
+    def test_missing_new_key_fault_preserved_until_backup_restored(self, tmp_data, monkeypatch):
+        """不完整备份恢复：轮换新钥文件缺失时的故障保持与放回原钥后续办。"""
+        monkeypatch.setenv("ARCHIVE_DATA_DIR", tmp_data)
+        from app.service import Service
+
+        # 首轮挡住轮换工作线程，手工制造“部分重封装”的混合状态：
+        # img0 已重封装到新钥，img1/img2 仍在旧钥下。
+        blocked = {"on": True}
+        orig_worker = Service._rotation_worker
+
+        def gated_worker(self, rotation_id):
+            if blocked["on"]:
+                return
+            orig_worker(self, rotation_id)
+
+        monkeypatch.setattr(Service, "_rotation_worker", gated_worker)
+
+        payloads = {f"img{i}.tif": make_tiff(600 + i * 131, 40 + i) for i in range(3)}
+        names = list(payloads)
+
+        with TestClient(app) as client:
+            import app.main as main_mod
+
+            service = main_mod.service
+            ids = {name: _upload(client, p) for name, p in payloads.items()}
+            assert client.post("/api/rotations").status_code == 201
+            with service.lock:
+                rot = service._active_rotation()
+                old = service._row("SELECT * FROM project_keys WHERE id=?", (rot["old_kek_id"],))
+                new = service._row("SELECT * FROM project_keys WHERE id=?", (rot["new_kek_id"],))
+                target = service._row(
+                    "SELECT * FROM files WHERE current_kek_id=? ORDER BY id LIMIT 1",
+                    (old["id"],),
+                )
+                service._rewrap_one_locked(target, old, new, rot)
+                rotation_id = rot["rotation_id"]
+                old_key_id, new_key_id = old["key_id"], new["key_id"]
+                old_pk, new_pk = old["id"], new["id"]
+            # 一个已受理但未解封的下载（在途快照引用新钥）
+            r = client.post(f"/api/files/{ids[names[0]]}/downloads")
+            assert r.status_code == 201
+            dl_inflight = r.json()["download_id"]
+            st = client.get("/api/rotations/current").json()
+            assert st["active"] and st["rewrapped"] == 1 and st["total"] == 3
+
+        keys_dir = os.path.join(tmp_data, "keys")
+        new_key_path = os.path.join(keys_dir, new_key_id + ".kek")
+        old_key_path = os.path.join(keys_dir, old_key_id + ".kek")
+        with open(new_key_path, "rb") as fh:
+            new_key_backup = fh.read()  # 管理员手中的原密钥备份
+        blob_before = {}
+        for fid in ids.values():
+            with open(os.path.join(tmp_data, "vault", fid + ".blob"), "rb") as fh:
+                blob_before[fid] = fh.read()
+
+        blocked["on"] = False
+        os.unlink(new_key_path)  # 模拟：从不完整备份恢复，新课题密钥文件缺失
+
+        def assert_fault_state(client):
+            st = client.get("/api/rotations/current").json()
+            assert st["active"], st  # 不报完成
+            assert st["rewrapped"] == 1 and st["total"] == 3  # 原轮换进度保留
+            assert st["rotation_id"] == rotation_id
+            assert st["fault"] and st["fault"]["kek_id"] == new_pk
+            assert st["fault"]["affected_files"] == 1
+            keys = {k["id"]: k for k in client.get("/api/keys").json()}
+            assert len(keys) == 2  # 未生成任何新密钥行
+            assert keys[new_pk]["fault"] and not keys[new_pk]["file_exists"]
+            assert keys[old_pk]["file_exists"] and not keys[old_pk]["fault"]
+            files = {f["file_id"]: f for f in client.get("/api/files").json()}
+            assert not files[ids[names[0]]]["kek_file_exists"]  # 受影响影像
+            assert files[ids[names[1]]]["kek_file_exists"]
+            assert os.path.exists(old_key_path)  # 旧钥保留
+            # 受影响下载明确报错；其它可读影像仍能下载
+            r = client.post(f"/api/files/{ids[names[0]]}/downloads")
+            assert r.status_code == 503 and "密钥" in r.json()["error"]
+            assert _download(client, ids[names[1]]) == payloads[names[1]]
+            assert _download(client, ids[names[2]]) == payloads[names[2]]
+            # 反复重启不改写原件密文
+            for fid, blob in blob_before.items():
+                with open(os.path.join(tmp_data, "vault", fid + ".blob"), "rb") as fh:
+                    assert fh.read() == blob
+
+        # 重启 1：进入故障，不生成替代密钥、不报完成
+        with TestClient(app) as client:
+            assert_fault_state(client)
+            assert not os.path.exists(new_key_path)
+            assert sorted(os.listdir(keys_dir)) == [old_key_id + ".kek"]
+            # 故障期间新上传无法登记（明确报错而非生成替代密钥）
+            r = client.post("/api/uploads", json={"filename": "new.tif", "size": 64})
+            uid = r.json()["upload_id"]
+            assert client.put(
+                f"/api/uploads/{uid}/content", content=make_tiff(64, 99)
+            ).status_code == 200
+            r = client.post(f"/api/uploads/{uid}/complete")
+            assert r.status_code == 503 and "密钥" in r.json()["error"]
+            # 崩溃前受理的下载快照已被恢复流程中断
+            dl = next(
+                d for d in client.get("/api/downloads").json()
+                if d["download_id"] == dl_inflight
+            )
+            assert dl["state"] == "interrupted"
+
+        # 重启 2（什么都不做）：故障保持，仍不生成替代密钥、不改写密文
+        with TestClient(app) as client:
+            assert_fault_state(client)
+            assert not os.path.exists(new_key_path)
+
+        # 重启 3：放回无法解封既有数据密钥的错误密钥 → 仍保持故障，不删旧钥
+        from app import crypto as app_crypto
+
+        app_crypto.save_kek_file(new_key_path, os.urandom(32))
+        with TestClient(app) as client:
+            st = client.get("/api/rotations/current").json()
+            assert st["active"] and st["fault"] and st["fault"]["kind"] == "cannot_unwrap"
+            assert os.path.exists(old_key_path)  # 旧钥仍未删除
+            r = client.post(f"/api/files/{ids[names[0]]}/downloads")
+            assert r.status_code == 201  # 密钥文件存在可受理
+            r = client.get(f"/api/downloads/{r.json()['download_id']}/content")
+            assert r.status_code == 500 and "密钥" in r.json()["error"]  # 解封失败明确报错
+            assert _download(client, ids[names[1]]) == payloads[names[1]]
+
+        # 重启 4：放回正确的原密钥备份 → 自动续办同一次轮换至完成
+        with open(new_key_path, "wb") as fh:
+            fh.write(new_key_backup)
+        os.chmod(new_key_path, 0o600)
+        with TestClient(app) as client:
+            wait_until(lambda: (
+                (s := client.get("/api/rotations/current").json())["active"] is False
+                and s["last"] is not None and s["last"]["state"] == "completed"))
+            st = client.get("/api/rotations/current").json()
+            assert st["last"]["rotation_id"] == rotation_id  # 续办的是同一次轮换
+            assert st["last"]["rewrapped"] == st["last"]["total"] == 3
+            assert st["fault"] is None
+            assert not os.path.exists(old_key_path)  # 收尾后旧钥才删除
+            for name, p in payloads.items():
+                assert _download(client, ids[name]) == p
+            for fid, blob in blob_before.items():
+                with open(os.path.join(tmp_data, "vault", fid + ".blob"), "rb") as fh:
+                    assert fh.read() == blob  # 全程未改写原件密文

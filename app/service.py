@@ -174,14 +174,120 @@ class Service:
     # ------------------------------------------------------------------ #
     # 启动恢复
     # ------------------------------------------------------------------ #
+    # 课题密钥故障角色说明（用于状态接口与网页展示）
+    _FAULT_ROLE_LABELS = {"new": "轮换新钥", "old": "轮换旧钥"}
+
+    def _rotation_fault_locked(self, rot: sqlite3.Row) -> dict[str, Any] | None:
+        """检测当前轮换的课题密钥故障（不完整备份恢复的典型后果）。
+
+        对新旧两把课题密钥分别判定两类故障：
+        1) 密钥文件缺失，但仍有已归档影像或在途下载引用它（missing）——
+           此时绝不能生成替代密钥，否则已用原密钥封装的影像将永远无法解封；
+        2) 密钥文件存在，但无法解封既有数据密钥（cannot_unwrap）——
+           管理员放回的密钥与原密钥不一致，继续推进只会把更多 DEK 封装到
+           错误密钥上。
+
+        故障期间调用方必须：保留轮换进度与旧钥、不删除任何密钥、不报完成。
+        返回 None 表示无故障，否则返回故障详情（状态接口展示 + worker 停等）。
+        """
+        for role, kek_pk in (("new", rot["new_kek_id"]), ("old", rot["old_kek_id"])):
+            key = self._row("SELECT * FROM project_keys WHERE id=?", (kek_pk,))
+            if key is None or key["status"] == "deleted":
+                continue
+            label = self._FAULT_ROLE_LABELS[role]
+            path = self._kek_path(key["key_id"])
+            files_ref = self._row(
+                "SELECT COUNT(*) AS c FROM files WHERE current_kek_id=?", (kek_pk,)
+            )["c"]
+            dl_ref = self._row(
+                "SELECT COUNT(*) AS c FROM downloads WHERE kek_id=? AND wrapped_dek IS NOT NULL",
+                (kek_pk,),
+            )["c"]
+            fault_kind: str | None = None
+            if not os.path.exists(path):
+                if files_ref or dl_ref:
+                    fault_kind = "missing"
+            elif files_ref:
+                # 密钥文件存在：必须能解封既有数据密钥，否则就是放回了错误的密钥。
+                # 直接读盘而不走缓存：管理员放回正确备份后无需重启即可被重新验证。
+                sample = self._row(
+                    "SELECT dek_nonce, wrapped_dek FROM files "
+                    "WHERE current_kek_id=? ORDER BY id LIMIT 1",
+                    (kek_pk,),
+                )
+                try:
+                    kek = crypto.load_kek_file(path)
+                    crypto.unwrap_dek(kek, sample["dek_nonce"], sample["wrapped_dek"])
+                except Exception:
+                    fault_kind = "cannot_unwrap"
+                else:
+                    self._kek_cache[kek_pk] = kek  # 验证通过，刷新内存缓存
+            if fault_kind is None:
+                continue
+            if fault_kind == "missing":
+                message = (
+                    f"{label} #{key['id']} 的密钥文件 keys/{key['key_id']}.kek 缺失，"
+                    f"但仍有 {files_ref} 件已归档影像、{dl_ref} 个在途下载引用它。"
+                    "请将原课题密钥备份放回原路径并重启服务：轮换进度已保留，"
+                    "旧钥未删除，不会生成替代密钥。"
+                )
+            else:
+                message = (
+                    f"{label} #{key['id']} 无法解封既有数据密钥（放回的密钥可能与"
+                    "原密钥不一致）。轮换保持故障暂停，旧钥未删除；"
+                    "请放回正确的原密钥备份并重启服务。"
+                )
+            return {
+                "role": role,
+                "kind": fault_kind,
+                "kek_id": key["id"],
+                "key_id": key["key_id"],
+                "affected_files": files_ref,
+                "affected_downloads": dl_ref,
+                "message": message,
+            }
+        return None
+
+    def _ensure_new_key_file_locked(self, new: sqlite3.Row) -> None:
+        """极端情况：新 KEK 行已提交但密钥文件未落地（写文件前崩溃）时补齐文件。
+
+        前提是该新钥还没有任何数据引用（已归档影像或在途下载的快照封装材料）。
+        只要存在引用，缺失新钥就是不完整备份恢复造成的故障，必须由管理员放回
+        原密钥备份——此时绝不生成替代密钥（否则已封装的影像将永远无法解封）。
+        """
+        path = self._kek_path(new["key_id"])
+        if os.path.exists(path):
+            return
+        refs = self._row(
+            "SELECT COUNT(*) AS c FROM files WHERE current_kek_id=?", (new["id"],)
+        )["c"]
+        refs += self._row(
+            "SELECT COUNT(*) AS c FROM downloads WHERE kek_id=? AND wrapped_dek IS NOT NULL",
+            (new["id"],),
+        )["c"]
+        if refs:
+            return  # 被引用：属于缺钥故障，由 _rotation_fault_locked 报告并停等
+        kek = crypto.new_kek()
+        crypto.save_kek_file(path, kek)
+        self._kek_cache[new["id"]] = kek
+
     def _recover(self) -> None:
         """进程重启后清理在途会话、续办未完成的轮换。
 
         已归档文件（files 表 + vault 密文）永远保留，且其 DEK 始终可由
         某个未删除的 KEK 解封——只有在没有任何引用/在途使用后旧 KEK 才会删除。
+
+        不完整备份恢复（如轮换中的新课题密钥文件缺失）时：保留原轮换进度与
+        旧钥，绝不生成替代密钥、绝不报完成；管理员把原密钥备份放回原路径并
+        重启后，自动续办同一次轮换。
         """
         with self.lock:
             now = self._now()
+
+            # 0) 轮换密钥故障预检：必须在清理在途会话（会清除下载快照的封装材料）
+            #    之前统计引用，否则“在途下载引用缺失新钥”的故障会被漏检。
+            rot0 = self._active_rotation()
+            rotation_fault = self._rotation_fault_locked(rot0) if rot0 is not None else None
 
             # 1) 未完成上传：内存 DEK 已随进程消失，暂存密文无法登记，清理。
             pending_uploads = self._all(
@@ -215,20 +321,17 @@ class Service:
                 if path not in referenced:
                     self._unlink_quiet(path)
 
-            # 4) 续办/收尾未完成的轮换。
+            # 4) 续办/收尾未完成的轮换；存在密钥故障时保持原状（不推进、不删钥、
+            #    不生成替代密钥、不报完成），等待管理员放回原密钥备份后重启。
             rot = self._active_rotation()
-            if rot is not None:
+            if rot is not None and rotation_fault is None:
                 old = self._row("SELECT * FROM project_keys WHERE id=?", (rot["old_kek_id"],))
                 new = self._row("SELECT * FROM project_keys WHERE id=?", (rot["new_kek_id"],))
                 old_file_exists = old is not None and os.path.exists(self._kek_path(old["key_id"]))
-                new_file_exists = new is not None and os.path.exists(self._kek_path(new["key_id"]))
-                if not new_file_exists:
+                if new is not None:
                     # 极端情况：新 KEK 行已提交但密钥文件未落地（写文件前崩溃）。
-                    # 此时还没有任何文件用新 KEK 封装，重新生成并补齐文件即可。
-                    new_kek = crypto.new_kek()
-                    crypto.save_kek_file(new["path"], new_kek)
-                    self._kek_cache[new["id"]] = new_kek
-                    new_file_exists = True
+                    # 仅在没有任何数据引用时才允许补齐（故障预检保证被引用时走故障路径）。
+                    self._ensure_new_key_file_locked(new)
                 if not old_file_exists:
                     # 旧 KEK 文件已被删除：重封装/收尾事实上已完成，补完状态。
                     if old is not None and old["status"] != "deleted":
@@ -382,6 +485,13 @@ class Service:
                 raise ServiceError("上传会话在暂停期间状态发生变化", 409)
 
             active = self._ensure_active_key_locked()
+            if not os.path.exists(self._kek_path(active["key_id"])):
+                # 缺钥故障期间明确报错，绝不生成替代密钥来登记新上传。
+                raise ServiceError(
+                    "当前课题密钥文件缺失，无法登记新上传："
+                    "请将原课题密钥备份放回原路径并重启服务",
+                    503,
+                )
             dek_nonce = crypto.new_nonce()
             wrapped_dek = crypto.wrap_dek(self._get_kek(active["id"]), dek_nonce, dek)
 
@@ -454,6 +564,15 @@ class Service:
             f = self._row("SELECT * FROM files WHERE file_id=?", (file_id,))
             if f is None:
                 raise ServiceError("文件不存在", 404)
+            # 缺钥故障快速失败：封装该影像的课题密钥文件缺失时明确报错，
+            # 而不是受理一个注定无法解封的会话。
+            kek_row = self._row("SELECT * FROM project_keys WHERE id=?", (f["current_kek_id"],))
+            if kek_row is None or not os.path.exists(self._kek_path(kek_row["key_id"])):
+                raise ServiceError(
+                    "课题密钥文件缺失，该影像暂不可下载："
+                    "请将原课题密钥备份放回原路径并重启服务",
+                    503,
+                )
             download_id = uuid.uuid4().hex
             now = self._now()
             # 受理即快照：即使随后轮换重封装了 files 行，在途下载仍持有
@@ -515,15 +634,29 @@ class Service:
                 raise ServiceError("课题密钥记录缺失，无法解封", 500)
             if not os.path.exists(self._kek_path(kek_row["key_id"])):
                 raise ServiceError(
-                    "课题密钥文件已被删除，在途下载无法解封（收尾逻辑不应允许此情况）", 500
+                    "课题密钥文件缺失，该影像暂不可下载："
+                    "请将原课题密钥备份放回原路径并重启服务",
+                    503,
                 )
-            kek = self._get_kek(kek_row["id"])
-            dek = crypto.unwrap_dek(kek, dl["dek_nonce"], dl["wrapped_dek"])
+            try:
+                kek = self._get_kek(kek_row["id"])
+                dek = crypto.unwrap_dek(kek, dl["dek_nonce"], dl["wrapped_dek"])
+            except ServiceError:
+                raise
+            except Exception as exc:
+                raise ServiceError(
+                    "课题密钥无法解封该影像的数据密钥（密钥文件与原密钥不一致），"
+                    "请放回正确的原课题密钥备份",
+                    500,
+                ) from exc
 
             with open(f["blob_path"], "rb") as bf:
                 blob = bf.read()
             nonce, ciphertext = blob[: crypto.NONCE_SIZE], blob[crypto.NONCE_SIZE:]
-            plaintext = crypto.decrypt_blob(dek, nonce, ciphertext)
+            try:
+                plaintext = crypto.decrypt_blob(dek, nonce, ciphertext)
+            except Exception as exc:
+                raise ServiceError("原件密文校验失败，密文可能已损坏", 500) from exc
 
             if hashlib.sha256(plaintext).hexdigest() != f["sha256"]:
                 raise ServiceError("解密后摘要校验失败，原件可能已损坏", 500)
@@ -614,40 +747,50 @@ class Service:
                 new = self._row("SELECT * FROM project_keys WHERE id=?", (rot["new_kek_id"],))
                 if old is None or new is None:
                     return
-                # 旧 KEK 文件已不在（例如外部清理/重启竞态）：直接补完状态。
-                if not os.path.exists(self._kek_path(old["key_id"])):
-                    self._finalize_rotation_locked(rot)
-                    return
 
-                # 1) 重封装仍引用旧 KEK 的已归档文件（每次一件，可被重启打断后续办）。
-                target = self._row(
-                    "SELECT * FROM files WHERE current_kek_id=? ORDER BY id LIMIT 1",
-                    (old["id"],),
-                )
-                if target is not None:
-                    self._rewrap_one_locked(target, old, new, rot)
-                    continue
+                # 故障屏障：课题密钥缺失/无法解封且仍被引用时，保留轮换进度与旧钥，
+                # 不推进重封装、不删除旧钥、绝不报完成，原地等待管理员放回原密钥
+                # （文件恢复后无需重启也会自动继续）。
+                fault = self._rotation_fault_locked(rot)
+                if fault is not None:
+                    pass
+                else:
+                    self._ensure_new_key_file_locked(new)
+                    # 旧 KEK 文件已不在且无任何引用（故障屏障已排除仍被引用的情况）：
+                    # 补完状态。若收尾条件被新出现的引用打破，下一轮会进入故障屏障停等。
+                    if not os.path.exists(self._kek_path(old["key_id"])):
+                        self._finalize_rotation_locked(rot)
+                        continue
 
-                # 2) 等待在途会话全部结束。
-                blocking_uploads = self._row(
-                    "SELECT COUNT(*) AS c FROM uploads "
-                    "WHERE state IN ('created','pending_register')"
-                )["c"]
-                blocking_downloads = self._row(
-                    "SELECT COUNT(*) AS c FROM downloads "
-                    "WHERE state IN ('accepted','unwrapping')"
-                )["c"]
-                self.conn.execute(
-                    "UPDATE rotations SET state='completing', blocking_uploads=?, "
-                    "blocking_downloads=? WHERE id=?",
-                    (blocking_uploads, blocking_downloads, rot["id"]),
-                )
-                self.conn.commit()
+                    # 1) 重封装仍引用旧 KEK 的已归档文件（每次一件，可被重启打断后续办）。
+                    target = self._row(
+                        "SELECT * FROM files WHERE current_kek_id=? ORDER BY id LIMIT 1",
+                        (old["id"],),
+                    )
+                    if target is not None:
+                        self._rewrap_one_locked(target, old, new, rot)
+                        continue
 
-                if blocking_uploads == 0 and blocking_downloads == 0:
-                    # 3) 所有旧钥引用与在途使用均已结束，实际删除旧 KEK 文件后才报完成。
-                    self._finalize_rotation_locked(rot)
-                    return
+                    # 2) 等待在途会话全部结束。
+                    blocking_uploads = self._row(
+                        "SELECT COUNT(*) AS c FROM uploads "
+                        "WHERE state IN ('created','pending_register')"
+                    )["c"]
+                    blocking_downloads = self._row(
+                        "SELECT COUNT(*) AS c FROM downloads "
+                        "WHERE state IN ('accepted','unwrapping')"
+                    )["c"]
+                    self.conn.execute(
+                        "UPDATE rotations SET state='completing', blocking_uploads=?, "
+                        "blocking_downloads=? WHERE id=?",
+                        (blocking_uploads, blocking_downloads, rot["id"]),
+                    )
+                    self.conn.commit()
+
+                    if blocking_uploads == 0 and blocking_downloads == 0:
+                        # 3) 所有旧钥引用与在途使用均已结束，实际删除旧 KEK 文件后才报完成。
+                        self._finalize_rotation_locked(rot)
+                        return
             time.sleep(WORKER_POLL_SECONDS)
 
     def _rewrap_one_locked(
@@ -721,9 +864,13 @@ class Service:
                     "active": False,
                     "state": "idle",
                     "last": self._rotation_brief(last) if last else None,
+                    "fault": None,
                 }
             else:
                 payload = {"active": True, **self._rotation_brief(rot)}
+                # 密钥故障实时判定（缺失仍被引用 / 无法解封既有数据密钥），
+                # 网页据此展示故障密钥与受影响影像。
+                payload["fault"] = self._rotation_fault_locked(rot)
             active_key = self._active_key()
             payload["active_kek"] = (
                 {"id": active_key["id"], "key_id": active_key["key_id"], "created_at": active_key["created_at"]}
@@ -775,6 +922,8 @@ class Service:
                     "sha256": r["sha256"],
                     "kek_id": r["current_kek_id"],
                     "kek_key_id": r["kek_key_id"],
+                    # 封装该影像的课题密钥文件是否仍在（缺失即受影响影像）
+                    "kek_file_exists": os.path.exists(self._kek_path(r["kek_key_id"])),
                     "created_at": r["created_at"],
                 }
                 for r in rows
@@ -785,7 +934,29 @@ class Service:
             rows = self._all(
                 "SELECT id, key_id, status, created_at, deleted_at FROM project_keys ORDER BY id"
             )
-            return [dict(r) | {"file_exists": os.path.exists(self._kek_path(r["key_id"]))} for r in rows]
+            result: list[dict[str, Any]] = []
+            for r in rows:
+                file_exists = os.path.exists(self._kek_path(r["key_id"]))
+                ref_files = self._row(
+                    "SELECT COUNT(*) AS c FROM files WHERE current_kek_id=?", (r["id"],)
+                )["c"]
+                ref_downloads = self._row(
+                    "SELECT COUNT(*) AS c FROM downloads WHERE kek_id=? AND wrapped_dek IS NOT NULL",
+                    (r["id"],),
+                )["c"]
+                result.append(
+                    dict(r)
+                    | {
+                        "file_exists": file_exists,
+                        "referenced_files": ref_files,
+                        "referenced_downloads": ref_downloads,
+                        # 故障密钥：文件缺失但仍被引用（不完整备份恢复的典型后果）
+                        "fault": (not file_exists)
+                        and (ref_files > 0 or ref_downloads > 0)
+                        and r["status"] != "deleted",
+                    }
+                )
+            return result
 
     def list_uploads(self) -> list[dict[str, Any]]:
         with self.lock:
