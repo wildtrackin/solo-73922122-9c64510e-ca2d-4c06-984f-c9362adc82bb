@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>科研影像加密归档 · 单课题</title>
+<style>
+  :root {
+    --bg: #0f141b; --panel: #18202b; --panel2: #1f2937; --line: #2b3747;
+    --text: #e6edf3; --muted: #8b98a9; --accent: #4f9cf9; --green: #3fb950;
+    --amber: #d29922; --red: #f85149; --purple: #a371f7;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.55 -apple-system, "PingFang SC", "Microsoft YaHei", Segoe UI, sans-serif; }
+  header { padding: 18px 26px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 14px; background: #121923; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .ver { color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 18px 26px; max-width: 1280px; margin: 0 auto; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .panel.full { grid-column: 1 / -1; }
+  .panel h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .panel h2 .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 7px;
+    padding: 7px 14px; font-size: 13px; cursor: pointer; }
+  button:hover { filter: brightness(1.1); }
+  button.secondary { background: var(--panel2); border: 1px solid var(--line); }
+  button.warn { background: var(--amber); color: #1b1b1b; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  input[type=file] { color: var(--muted); max-width: 100%; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  td.mono, .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; white-space: nowrap; }
+  .b-active { background: rgba(63,185,80,.15); color: var(--green); }
+  .b-rotating, .b-running, .b-completing, .b-unwrapping, .b-pending_register, .b-accepted {
+    background: rgba(210,153,34,.16); color: var(--amber); }
+  .b-deleted, .b-aborted, .b-failed, .b-interrupted { background: rgba(248,81,73,.15); color: var(--red); }
+  .b-completed { background: rgba(63,185,80,.15); color: var(--green); }
+  .b-created { background: rgba(79,156,249,.16); color: var(--accent); }
+  .b-idle { background: rgba(139,152,169,.18); color: var(--muted); }
+  .progress { height: 10px; background: var(--panel2); border-radius: 6px; overflow: hidden; margin: 8px 0 6px; }
+  .progress > div { height: 100%; background: linear-gradient(90deg, var(--accent), var(--purple)); transition: width .3s; }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 12.5px; }
+  .kv .k { color: var(--muted); }
+  .gate { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; background: var(--panel2); }
+  .gate .state { font-size: 12px; color: var(--muted); }
+  .steps { display: flex; gap: 6px; margin: 10px 0; flex-wrap: wrap; }
+  .step { flex: 1; min-width: 120px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel2); font-size: 12px; color: var(--muted); }
+  .step.done { border-color: var(--green); color: var(--green); }
+  .step.cur { border-color: var(--amber); color: var(--amber); }
+  #log { background: #0b1017; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+    height: 180px; overflow-y: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+  #log .e { margin-bottom: 3px; }
+  #log .t { color: var(--muted); margin-right: 8px; }
+  #log .err { color: var(--red); } #log .ok { color: var(--green); } #log .info { color: var(--accent); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .small { font-size: 11.5px; color: var(--muted); }
+  .truncate { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>科研影像加密归档</h1>
+  <span class="ver">单课题 · 单进程 · FastAPI + SQLite + cryptography（AES-256-GCM）</span>
+  <span class="small" style="margin-left:auto" id="health">连接中…</span>
+</header>
+
+<main>
+  <!-- 课题密钥与轮换 -->
+  <section class="panel">
+    <h2>① 课题密钥与轮换 <span class="hint">同期只允许一次轮换；仅重封装 DEK，不改原件密文</span></h2>
+    <div class="kv">
+      <div class="k">当前课题密钥</div><div class="mono" id="active-kek">—</div>
+      <div class="k">轮换状态</div><div><span class="badge b-idle" id="rot-state">idle</span>
+        <span class="small" id="rot-msg"></span></div>
+    </div>
+    <div class="progress"><div id="rot-bar" style="width:0%"></div></div>
+    <div class="small" id="rot-numbers">—</div>
+    <div class="row" style="margin-top:10px">
+      <button id="btn-rotate">发起密钥轮换</button>
+      <span class="small">阻塞中上传 <b id="blk-up">0</b> · 阻塞中下载 <b id="blk-dl">0</b></span>
+    </div>
+    <h2 style="margin-top:16px">课题密钥目录 keys/（与 vault/ 密文分目录）</h2>
+    <table><thead><tr><th>ID</th><th>key_id</th><th>状态</th><th>密钥文件</th><th>创建时间</th></tr></thead>
+      <tbody id="keys-body"></tbody></table>
+  </section>
+
+  <!-- 演示暂停门 -->
+  <section class="panel">
+    <h2>② 演示控制：暂停点 <span class="hint">关闭闸门后，到达检查点的会话在此等待</span></h2>
+    <div class="gate">
+      <div>
+        <div>上传待登记 <span class="mono small">(pending_register → complete)</span></div>
+        <div class="state" id="g-up-state">放行中 · 等待 0</div>
+      </div>
+      <div class="row">
+        <button class="warn" onclick="setGate('upload_register', true)">暂停</button>
+        <button class="secondary" onclick="setGate('upload_register', false)">恢复</button>
+      </div>
+    </div>
+    <div class="gate">
+      <div>
+        <div>下载待解封 <span class="mono small">(accepted → unwrapping)</span></div>
+        <div class="state" id="g-dl-state">放行中 · 等待 0</div>
+      </div>
+      <div class="row">
+        <button class="warn" onclick="setGate('download_unwrap', true)">暂停</button>
+        <button class="secondary" onclick="setGate('download_unwrap', false)">恢复</button>
+      </div>
+    </div>
+    <p class="small">暂停上传闸门后再上传，DEK 只在内存、密文暂存于 staging/，页面会停在“待登记”；
+      暂停下载闸门后发起下载，会话停在“待解封”，恢复后才解封并读完原件。</p>
+    <h2 style="margin-top:14px">操作日志</h2>
+    <div id="log"></div>
+  </section>
+
+  <!-- 上传 -->
+  <section class="panel full">
+    <h2>③ 上传 TIFF（每件 ≤ 8 MiB，独立随机 DEK 加密，原件明文不落盘）</h2>
+    <div class="row">
+      <input type="file" id="file-input" accept=".tif,.tiff" />
+      <button id="btn-upload">上传</button>
+      <span class="small" id="upload-hint"></span>
+    </div>
+    <div class="steps">
+      <div class="step" id="st-1">1. 受理（created）</div>
+      <div class="step" id="st-2">2. 内存 DEK 加密 → 暂存（pending_register，待登记暂停点）</div>
+      <div class="step" id="st-3">3. 以当前课题密钥封装 DEK 并登记归档（completed）</div>
+    </div>
+    <table><thead><tr><th>upload_id</th><th>文件名</th><th>大小</th><th>状态</th><th>SHA-256</th><th>时间</th><th></th></tr></thead>
+      <tbody id="uploads-body"></tbody></table>
+  </section>
+
+  <!-- 文件列表 / 下载 -->
+  <section class="panel full">
+    <h2>④ 已归档影像与下载 <span class="hint">受理即快照 KEK/封装DEK，轮换重封装后在途下载仍可读完</span></h2>
+    <table><thead><tr><th>file_id</th><th>文件名</th><th>大小</th><th>封装密钥</th><th>SHA-256</th><th>归档时间</th><th></th></tr></thead>
+      <tbody id="files-body"></tbody></table>
+    <h2 style="margin-top:16px">下载会话</h2>
+    <table><thead><tr><th>download_id</th><th>文件</th><th>使用 KEK</th><th>状态</th><th>时间</th><th></th></tr></thead>
+      <tbody id="downloads-body"></tbody></table>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const api = async (method, url, body) => {
+  const opt = { method, headers: {} };
+  if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  const r = await fetch(url, opt);
+  const data = r.status === 204 ? null : await r.json().catch(() => null);
+  if (!r.ok) throw new Error((data && data.error) || (r.status + ' ' + r.statusText));
+  return data;
+};
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtSize = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n/1024).toFixed(1)+' KiB' : (n/1048576).toFixed(2)+' MiB';
+const short = (s, n=12) => s ? String(s).slice(0,n)+'…' : '—';
+function log(msg, level='') {
+  const el = $('log'); const d = document.createElement('div');
+  d.className = 'e ' + level;
+  d.innerHTML = '<span class="t">' + new Date().toLocaleTimeString() + '</span>' + esc(msg);
+  el.appendChild(d); el.scrollTop = el.scrollHeight;
+}
+const badge = (s) => `<span class="badge b-${esc(s)}">${esc(s)}</span>`;
+
+// ---------- 上传 ----------
+$('btn-upload').onclick = async () => {
+  const f = $('file-input').files[0];
+  if (!f) return log('请先选择 TIFF 文件', 'err');
+  try {
+    const init = await api('POST', '/api/uploads', { filename: f.name, size: f.size });
+    log(`受理上传 ${init.upload_id.slice(0,8)}…（${f.name}，${fmtSize(f.size)}）`, 'info');
+    const buf = await f.arrayBuffer();
+    const saved = await fetch(`/api/uploads/${init.upload_id}/content`, { method:'PUT', body: buf }).then(async r => {
+      const d = await r.json().catch(()=>null); if (!r.ok) throw new Error(d?.error || r.statusText); return d;
+    });
+    log(`已用独立随机 DEK 加密并暂存，SHA-256=${saved.sha256.slice(0,16)}…，状态 pending_register（待登记）`, 'info');
+    const done = await api('POST', `/api/uploads/${init.upload_id}/complete`);
+    log(`登记完成，归档为 ${done.file_id ? done.file_id.slice(0,8)+'…' : ''}`, 'ok');
+    await refresh();
+  } catch (e) { log('上传失败：' + e.message, 'err'); await refresh(); }
+};
+
+// ---------- 下载（两阶段） ----------
+async function startDownload(fileId, name) {
+  try {
+    const d = await api('POST', `/api/files/${fileId}/downloads`);
+    log(`下载受理 ${d.download_id.slice(0,8)}…（快照 KEK 与封装 DEK）`, 'info');
+    const r = await fetch(`/api/downloads/${d.download_id}/content`);
+    if (!r.ok) { const j = await r.json().catch(()=>null); throw new Error(j?.error || r.statusText); }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = name; a.click();
+    URL.revokeObjectURL(url);
+    log(`已解封并读完原件，浏览器下载 ${name}（${fmtSize(blob.size)}）`, 'ok');
+    await refresh();
+  } catch (e) { log('下载失败：' + e.message, 'err'); await refresh(); }
+}
+async function abortDownload(id) { await api('POST', `/api/downloads/${id}/abort`); log('已中止下载会话 ' + id.slice(0,8), ''); refresh(); }
+async function abortUpload(id) { await api('POST', `/api/uploads/${id}/abort`); log('已中止上传会话 ' + id.slice(0,8), ''); refresh(); }
+
+// ---------- 轮换 ----------
+$('btn-rotate').onclick = async () => {
+  try { await api('POST', '/api/rotations'); log('已发起课题密钥轮换', 'info'); await refresh(); }
+  catch (e) { log('轮换被拒绝：' + e.message, 'err'); }
+};
+async function setGate(name, paused) {
+  try { await api('POST', `/api/demo/gates/${name}`, { paused });
+    log((paused ? '已暂停' : '已恢复') + (name === 'upload_register' ? '「上传待登记」' : '「下载待解封」') + '闸门', '');
+    refresh();
+  } catch (e) { log(e.message, 'err'); }
+}
+
+// ---------- 轮询渲染 ----------
+async function refresh() {
+  try {
+    const [cfg, status, keys, files, uploads, downloads] = await Promise.all([
+      api('GET','/api/config'), api('GET','/api/rotations/current'),
+      api('GET','/api/keys'), api('GET','/api/files'),
+      api('GET','/api/uploads'), api('GET','/api/downloads'),
+    ]);
+    $('health').textContent = '服务在线 · 上限 ' + cfg.max_file_size_mib + ' MiB/件';
+    $('upload-hint').textContent = `单文件上限 ${cfg.max_file_size_mib} MiB`;
+
+    $('active-kek').textContent = status.active_kek ? '#' + status.active_kek.id + '  ' + status.active_kek.key_id : '—';
+    const st = status.active ? status.state : 'idle';
+    $('rot-state').textContent = st; $('rot-state').className = 'badge b-' + st;
+    $('btn-rotate').disabled = !!status.active;
+    $('blk-up').textContent = status.active ? status.blocking_uploads : 0;
+    $('blk-dl').textContent = status.active ? status.blocking_downloads : 0;
+    if (status.active) {
+      const pct = status.total ? Math.round(status.rewrapped / status.total * 100) : 100;
+      $('rot-bar').style.width = pct + '%';
+      $('rot-numbers').textContent = `重封装 ${status.rewrapped}/${status.total} 件（${pct}%）· 新 KEK #${status.new_kek_id}`;
+      $('rot-msg').textContent = status.message || '';
+    } else {
+      $('rot-bar').style.width = status.last ? '100%' : '0%';
+      $('rot-numbers').textContent = status.last ? `上次轮换已于 ${status.last.completed_at} 完成：${status.last.message || ''}` : '尚无轮换记录';
+      $('rot-msg').textContent = '';
+    }
+
+    $('keys-body').innerHTML = keys.map(k =>
+      `<tr><td>${k.id}</td><td class="mono truncate" title="${esc(k.key_id)}">${esc(k.key_id)}</td>
+       <td>${badge(k.status)}</td><td>${k.file_exists ? '存在（600）' : '<span class="small">已删除</span>'}</td>
+       <td class="small">${esc(k.created_at)}</td></tr>`).join('') || '<tr><td colspan="5" class="small">暂无</td></tr>';
+
+    $('files-body').innerHTML = files.map(f =>
+      `<tr><td class="mono">${short(f.file_id)}</td><td class="truncate" title="${esc(f.filename)}">${esc(f.filename)}</td>
+       <td>${fmtSize(f.size)}</td><td class="mono">#${f.kek_id} ${short(f.kek_key_id,8)}</td>
+       <td class="mono small">${short(f.sha256,18)}</td><td class="small">${esc(f.created_at)}</td>
+       <td><button onclick="startDownload('${f.file_id}','${esc(f.filename)}')">下载</button></td></tr>`
+    ).join('') || '<tr><td colspan="7" class="small">暂无归档影像</td></tr>';
+
+    $('uploads-body').innerHTML = uploads.map(u =>
+      `<tr><td class="mono">${short(u.upload_id)}</td><td class="truncate">${esc(u.filename)}</td>
+       <td>${fmtSize(u.declared_size)}</td><td>${badge(u.state)}${u.error ? '<div class="small" style="color:var(--red)">'+esc(u.error)+'</div>':''}</td>
+       <td class="mono small">${short(u.sha256,16)}</td><td class="small">${esc(u.updated_at)}</td>
+       <td>${['created','pending_register'].includes(u.state) ? `<button class="secondary" onclick="abortUpload('${u.upload_id}')">中止</button>` : ''}</td></tr>`
+    ).join('') || '<tr><td colspan="7" class="small">暂无上传会话</td></tr>';
+
+    $('downloads-body').innerHTML = downloads.map(d =>
+      `<tr><td class="mono">${short(d.download_id)}</td><td class="truncate">${esc(d.filename)}</td>
+       <td class="mono">#${d.kek_id}</td><td>${badge(d.state)}</td><td class="small">${esc(d.updated_at)}</td>
+       <td>${['accepted','unwrapping'].includes(d.state) ? `<button class="secondary" onclick="abortDownload('${d.download_id}')">中止</button>` : ''}</td></tr>`
+    ).join('') || '<tr><td colspan="6" class="small">暂无下载会话</td></tr>';
+
+    const gu = status.gates.upload_register, gd = status.gates.download_unwrap;
+    $('g-up-state').textContent = (gu.paused ? '已暂停 · 等待 ' : '放行中 · 等待 ') + gu.waiting;
+    $('g-dl-state').textContent = (gd.paused ? '已暂停 · 等待 ' : '放行中 · 等待 ') + gd.waiting;
+
+    // 上传步骤条（取最新一条上传）
+    const latest = uploads[0];
+    const stage = latest ? { created:1, pending_register:2, completed:3, aborted:0, failed:0 }[latest.state] ?? 0 : 0;
+    [1,2,3].forEach(i => {
+      const el = $('st-'+i);
+      el.className = 'step' + (stage >= i && stage > 0 ? (stage === i ? ' cur' : ' done') : '');
+    });
+  } catch (e) {
+    $('health').textContent = '服务不可用：' + e.message;
+  }
+}
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
